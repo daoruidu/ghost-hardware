@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#050505">
+<title>幽灵硬件：跨窗口寄生</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;height:100%;background:#050505;color:#e9f8f4}
+body{font:13px/1.5 ui-monospace,"Cascadia Mono",Consolas,"Microsoft YaHei",monospace}
+canvas{position:fixed;inset:0;width:100%;height:100%;touch-action:manipulation}
+header,footer{position:fixed;left:clamp(16px,4vw,64px);right:clamp(16px,4vw,64px);pointer-events:none}
+header{top:clamp(16px,4vh,48px);display:flex;justify-content:space-between;align-items:flex-start}
+small{color:#83daca;letter-spacing:.19em;font-size:10px}h1{margin:5px 0 0;font:600 clamp(24px,3.4vw,48px)/1.12 system-ui;letter-spacing:.04em}
+.sub{margin:7px 0;color:#9aadaa;letter-spacing:.22em}.status{color:#a6efdd;border-top:1px solid #59857b;padding-top:6px}
+footer{bottom:max(14px,env(safe-area-inset-bottom),3vh)}section{background:linear-gradient(110deg,#172520f5,#101917ec);border:1px solid #35453f;border-radius:5px;padding:12px 16px;pointer-events:auto}
+.row,.actions{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.row{justify-content:space-between}.hint{margin:0;color:#c5d6d0}
+button{background:#172320;border:1px solid #657d75;color:#dbece6;border-radius:3px;padding:8px 12px;font:inherit;cursor:pointer}
+button:first-child{background:#cbf6e8;color:#10291f;border-color:#cbf6e8}button:hover{filter:brightness(1.16)}button:focus-visible,canvas:focus-visible{outline:2px solid #8effe0;outline-offset:3px}
+.tele{border-top:1px solid #34403c;margin-top:10px;padding-top:8px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px 16px;color:#9eafa9;font-size:11px}
+@media(max-width:650px){section{padding:9px 11px}.hint{width:100%}button{padding:6px 10px}.status{font-size:11px}.tele{margin-top:7px}}
+</style>
+</head>
+<body>
+<canvas id="field" tabindex="0" aria-label="发光的线框生命。点击或按空格发送脉冲。"></canvas>
+<header><div><small>GHOST HARDWARE</small><h1>幽灵硬件</h1><p class="sub">跨窗口寄生</p></div><span class="status" id="link" role="status">单体游离</span></header>
+<footer><section><div class="row"><p id="hint" class="hint">打开第二个窗口，把两扇窗口并排。</p><div class="actions"><button id="spawn">打开共生窗口 ↗</button><button id="mic" aria-pressed="false">开启麦克风</button></div></div>
+<div class="tele"><span id="power">电池 · 读取中</span><span id="sound" role="status">声场 · 未监听</span><span>点击生物 / 空格 · 脉冲</span></div></section></footer>
+<script>
+'use strict';
+const $=id=>document.getElementById(id), canvas=$('field');
+const g=canvas.getContext('2d',{alpha:false});
+const TAU=2*Math.PI, sin=Math.sin, cos=Math.cos;
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
+const room='ghost-hardware:'+location.origin+location.pathname;
+const selfId=Array.from(crypto.getRandomValues(new Uint32Array(3))).join('-'), born=Date.now();
+const peers=new Map(), reduce=matchMedia('(prefers-reduced-motion: reduce)');
+let channel,child,mate,live=true,frame=0,pulseAt=0,battery=null;
+let audio=null,stream=null,analyser=null,samples,level=0,floor=.012,micPending=false,micToken=0;
+let box=viewport(), geometry, partnerId, dpr=1, nextBox=0, nextAudio=0;
+function viewport(){
+  const w=innerWidth,h=innerHeight,rim=Math.max(0,(outerWidth-w)/2);
+  return {x:screenX+rim,y:screenY+Math.max(0,outerHeight-h-rim),w,h};
+}
+function sameBox(a,b){return a&&b&&a.x===b.x&&a.y===b.y&&a.w===b.w&&a.h===b.h}
+function resize(){
+  box=viewport();
+  dpr=Math.min(devicePixelRatio||1,1.8,Math.sqrt(2500000/Math.max(1,box.w*box.h)));
+  canvas.width=Math.max(1,Math.round(box.w*dpr));
+  canvas.height=Math.max(1,Math.round(box.h*dpr));
+  geometry=null;
+}
+function send(kind='state'){
+  if(!live)return;
+  const msg={room,kind,id:selfId,born,box,at:Date.now(),pulse:pulseAt,level,
+    bat:battery?.level??null,charging:battery?.charging??null};
+  try{channel?.postMessage(msg)}catch{}
+  for(const win of [window.opener,child])try{
+    if(win&&!win.closed)win.postMessage(msg,location.protocol==='file:'?'*':location.origin);
+  }catch{}
+}
+function pair(){
+  const list=[{id:selfId,born},...peers.values()].sort((a,b)=>a.born-b.born||a.id.localeCompare(b.id));
+  mate=list[list.findIndex(p=>p.id===selfId)^1];
+  partnerId=mate?.id;geometry=null;
+  $('link').textContent=mate?'双窗共生':'单体游离';
+  $('hint').textContent=mate?'已连接 · 移动窗口，观察同一束神经。':'打开第二个窗口，把两扇窗口并排。';
+}
+function receive(m){
+  if(!live||!m||m.room!==room||m.id===selfId||typeof m.id!=='string')return;
+  if(m.kind==='bye'){if(peers.delete(m.id))pair();return}
+  if(!Number.isFinite(m.born)||!m.box||!['x','y','w','h'].every(k=>Number.isFinite(m.box[k]))||m.box.w<=0||m.box.h<=0)return;
+  const prev=peers.get(m.id);
+  if(prev&&m.at<prev.at)return;
+  m.seen=Date.now();peers.set(m.id,m);
+  if(!prev)pair();
+  else if(m.id===partnerId){if(!sameBox(prev.box,m.box))geometry=null;mate=m}
+  if(!prev||m.kind==='hello')send();
+}
+function connect(){
+  try{channel=new BroadcastChannel(room);channel.onmessage=e=>receive(e.data)}catch{channel=null}
+  send('hello');
+}
+addEventListener('message',e=>{
+  if(!e.source||(e.source!==window.opener&&e.source!==child))return;
+  if(e.origin===(location.protocol==='file:'?'null':location.origin))receive(e.data);
+});
+$('spawn').onclick=()=>{
+  child=window.open(location.href,'_blank','popup,width=830,height=680');
+  if(!child)$('hint').textContent='弹窗被拦截。请允许弹窗，或再打开一份同一文件。';
+};
+// 屏幕坐标决定真实接缝；位置重叠的标签页在虚拟画布上左右相接。
+function stage(){
+  const first=!mate||born<mate.born||(born===mate.born&&selfId.localeCompare(mate.id)<0);
+  const A=first?box:mate.box,B={...(first?mate?.box:box)};
+  if(mate){
+    const ox=Math.max(0,Math.min(A.x+A.w,B.x+B.w)-Math.max(A.x,B.x));
+    const oy=Math.max(0,Math.min(A.y+A.h,B.y+B.h)-Math.max(A.y,B.y));
+    if(ox*oy>.48*Math.min(A.w*A.h,B.w*B.h)){B.x=A.x+A.w;B.y=A.y+(A.h-B.h)/2}
+  }
+  const view=first?A:B, ax=A.x+A.w*(mate ? .50 : .36),ay=A.y+A.h*.49;
+  const dx=(mate?B.x+B.w*.52:A.x+A.w*.99)-ax,dy=(mate?B.y+B.h*.49:A.y+A.h*.46)-ay;
+  const len=Math.hypot(dx,dy)||1, c=dx/len,s=dy/len, x=ax-view.x,y=ay-view.y;
+  const R=Math.min(A.w*.32,A.h*.39,mate?B.w*.32:Infinity,mate?B.h*.39:Infinity,300);
+  const origin=-x*c-y*s, ex=view.w*c,ey=view.h*s;
+  return {x,y,c,s,len,R,left:origin+Math.min(0,ex)+Math.min(0,ey)-R*.8,
+    right:origin+Math.max(0,ex)+Math.max(0,ey)+R*.8};
+}
+// 音频不接扬声器、不录制。只传音量和峰值时刻，用缓慢跟踪的底噪识别敲击。
+function stopMic(){
+  micToken++;micPending=false;stream?.getTracks().forEach(t=>t.stop());stream=null;
+  if(audio)audio.close().catch(()=>{}); audio=analyser=null;level=0;floor=.012;
+  $('mic').textContent='开启麦克风';$('mic').setAttribute('aria-pressed','false');$('sound').textContent='声场 · 未监听';
+}
+$('mic').onclick=async()=>{
+  if(audio||micPending){stopMic();return}
+  const token=++micToken; micPending=true;$('mic').textContent='取消开启';
+  try{
+    if(!navigator.mediaDevices?.getUserMedia)throw Error('unavailable');
+    const s=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+    if(token!==micToken){s.getTracks().forEach(t=>t.stop());return}
+    stream=s;audio=new AudioContext();analyser=audio.createAnalyser();analyser.fftSize=1024;
+    audio.createMediaStreamSource(s).connect(analyser);samples=new Float32Array(analyser.fftSize);
+    await audio.resume();if(token!==micToken)return;
+    s.getAudioTracks()[0].onended=()=>{stopMic();$('sound').textContent='声场 · 输入已断开'};
+    micPending=false;$('mic').textContent='关闭麦克风';$('mic').setAttribute('aria-pressed','true');$('sound').textContent='声场 · 正在监听';
+  }catch(e){if(token!==micToken)return;stopMic();$('sound').textContent=e.name==='NotAllowedError'?'声场 · 未获授权，可点击触发':'声场 · 麦克风不可用，可点击触发'}
+};
+function trigger(){pulseAt=Date.now();send('state')}
+canvas.onclick=trigger;
+canvas.onkeydown=e=>{if(e.code==='Space'){e.preventDefault();if(!e.repeat)trigger()}};
+function listen(){
+  if(!analyser||!samples)return;
+  analyser.getFloatTimeDomainData(samples);
+  let sum=0;for(let i=0;i<samples.length;i++)sum+=samples[i]*samples[i];
+  const rms=Math.sqrt(sum/samples.length);
+  level=Math.max(level*.84,clamp((rms-floor)*8,0,1));
+  if(rms>Math.max(.023,floor*2.7)&&Date.now()-pulseAt>420)trigger();
+  floor+=.018*(rms-floor);
+}
+function readPower(){
+  $('power').textContent=battery?'电池 · '+Math.round(battery.level*100)+'% / '+(battery.charging?'外部供电':battery.level<.25?'正在衰减':'电池供电'):'电池 · 设备未提供';
+  if(live)send('state');
+}
+if(navigator.getBattery)navigator.getBattery().then(b=>{battery=b;b.onlevelchange=b.onchargingchange=readPower;readPower()}).catch(readPower);
+else readPower();
+
+// 横环和纵线共享一份顶点表。截面轮廓和圆周谐波只在初始化时计算。
+const ROWS=64,SIDES=24,U0=-.48,DU=(1-U0)/ROWS;
+const X=new Float32Array((ROWS+1)*SIDES),Y=new Float32Array(X.length);
+const cs=[],sn=[],c3=[],s3=[],single=[],linked=[];
+for(let j=0;j<SIDES;j++){
+  const a=j*TAU/SIDES;cs[j]=cos(a);sn[j]=sin(a);c3[j]=cos(3*a);s3[j]=sin(3*a);
+}
+for(let i=0;i<=ROWS;i++){
+  const u=U0+i*DU, v=clamp((u-U0)/.78,0,1);
+  const core=.016+.36*Math.pow(Math.max(0,sin(Math.PI*v)),.68);
+  single[i]=core+.052*Math.exp(-((u-.89)**2)/.005);
+  linked[i]=core+.23*Math.exp(-((u-.89)**2)/.014);
+}
+// 将静态辉光烘入小画布；运动帧只需一次图像合成。
+const halo=document.createElement('canvas');halo.width=halo.height=128;
+const hg=halo.getContext('2d'),gradient=hg.createRadialGradient(64,64,0,64,64,64);
+gradient.addColorStop(0,'#36d2bc24');gradient.addColorStop(1,'#36d2bc00');
+hg.fillStyle=gradient;hg.fillRect(0,0,128,128);
+const hairs=Array.from({length:30},(_,k)=>{
+  const a=k*2.39996;
+  return {row:Math.round((-.40+(k%14)*.045-U0)/DU),side:Math.round(a/TAU*SIDES)%SIDES,
+    ca:cos(a),sa:sin(a)};
+});
+function ring(row,upper=row,mix=0){
+  const base=row*SIDES,next=upper*SIDES;
+  for(let j=0;j<SIDES;j++){
+    const k=base+j,n=next+j, x=X[k]+(X[n]-X[k])*mix,y=Y[k]+(Y[n]-Y[k])*mix;
+    if(j)g.lineTo(x,y);else g.moveTo(x,y);
+  }
+  g.closePath();
+}
+function stroke(color,width){g.strokeStyle=color;g.lineWidth=width;g.stroke()}
+function paint(now){
+  const v=geometry??(geometry=stage()), R=v.R;
+  const low=(battery&&battery.level<.25&&!battery.charging)||(mate&&mate.bat!=null&&mate.bat<.25&&!mate.charging);
+  const speed=reduce.matches ? .12 : low ? .42 : .85;
+  const t=(now-Math.min(born,mate?.born??born))*.001*speed;
+  const since=Math.max(0,(now-Math.max(pulseAt,mate?.pulse||0))*.001);
+  const loud=Math.max(level,mate&&now-mate.at<500?mate.level:0);
+  const shock=since<2?Math.exp(-3*since)*(reduce.matches ? .25 : 1):0;
+  const growth=mate?clamp((now-Math.max(born,mate.born))/1900,.035,1):1;
+  // 每帧完整覆盖不透明画布，消除历史像素。缓存尺寸与变换不依赖上一帧。
+  g.setTransform(1,0,0,1,0,0);g.fillStyle='#050505';g.fillRect(0,0,canvas.width,canvas.height);
+  if(R<=0)return;
+  g.setTransform(dpr*v.c,dpr*v.s,-dpr*v.s,dpr*v.c,dpr*v.x,dpr*v.y);
+  if(v.left<R&&v.right>-R)g.drawImage(halo,-R*.92,-R*.92,R*1.84,R*1.84);
+  // 只计算视口投影范围内的环，首尾各留一个邻环以保持窗口接缝连续。
+  const section=x=>(x/(x<0?R*1.6:v.len)-U0)/DU;
+  const first=Math.max(0,Math.floor(section(v.left))-1);
+  const last=Math.min(ROWS,Math.ceil(section(v.right))+1,Math.ceil((growth-U0)/DU));
+  if(first>last)return;
+  const profile=mate?linked:single;
+  for(let i=first;i<=last;i++){
+    const u=Math.min(growth,U0+i*DU), f=clamp(i-(u-U0)/DU,0,1);
+    const rad=R*(profile[i]+(profile[Math.max(0,i-1)]-profile[i])*f);
+    const x=u<0?u*R*1.6:u*v.len, y=R*(.066*sin(u*8-t)+.11*sin(u*4+t*.64));
+    const twist=.46*sin(u*6-t*.5),ct=cos(twist),st=sin(twist);
+    const phase=3*twist+9*u+t,ca=.11*cos(phase),sa=.11*sin(phase);
+    const breath=1+.09*sin(t*2.1-u*6)+.20*loud-.24*shock;
+    for(let j=0,k=i*SIDES;j<SIDES;j++,k++){
+      const r=rad*(breath+ca*c3[j]-sa*s3[j]);
+      X[k]=x+r*.46*(cs[j]*ct-sn[j]*st);Y[k]=y+r*(sn[j]*ct+cs[j]*st);
+    }
+  }
+  for(let bright=0;bright<2;bright++){
+    g.beginPath();
+    for(let i=first;i<=last;i++)if(Number(i%5===0)===bright)ring(i);
+    stroke(bright?'#dafff68c':'#69e6d343',bright?1:.72);
+    g.beginPath();
+    for(let j=0;j<SIDES;j++){
+      if(Number(j%4===0)!==bright)continue;
+      let k=first*SIDES+j;g.moveTo(X[k],Y[k]);
+      for(let i=first+1;i<=last;i++){k+=SIDES;g.lineTo(X[k],Y[k])}
+    }
+    stroke(bright?'#c5f9edab':'#62c4b24a',bright?1.12:.68);
+  }
+  g.beginPath();
+  const st=sin(t),ct=cos(t);
+  for(const h of hairs){
+    if(h.row<first||h.row>last||U0+h.row*DU>growth)continue;
+    const k=h.row*SIDES+h.side,x=X[k],y=Y[k], sway=st*h.ca+ct*h.sa;
+    const dx=R*(.25+.27*h.sa+.16*sway),dy=R*(.31*h.sa+.075*sway);
+    g.moveTo(x,y);g.bezierCurveTo(x+dx*.37,y+R*.12*h.sa,x+dx*.71,y+dy*.7-R*.07*sway,x+dx,y+dy);
+  }
+  stroke('#86d8c979',.75);
+  // 流动结点沿相邻两环插值，同一个脉冲在两扇窗里使用同一时间戳。
+  g.beginPath();
+  for(let j=0;j<16;j++){
+    const u=-.45+(t*.19+j*.089)%1.44, fi=(u-U0)/DU,i=Math.floor(fi);
+    if(u>growth||i<first||i+1>last)continue;
+    const k=i*SIDES+(j*7)%SIDES,n=k+SIDES,f=fi-i;
+    const x=X[k]+(X[n]-X[k])*f,y=Y[k]+(Y[n]-Y[k])*f,r=(j%4 ? .85 : 1.55)*(1+shock);
+    g.moveTo(x+r,y);g.arc(x,y,r,0,TAU);
+  }
+  g.fillStyle='#cbfff0';g.fill();
+  const u=since*.95-.45, fi=(u-U0)/DU,i=Math.floor(fi);
+  if(u<=growth&&i>=first&&i+1<=last){
+    g.beginPath();ring(i,i+1,fi-i);
+    stroke('#74ffe42c',5);stroke(reduce.matches?'#dcfff873':'#dcfff8ee',1.8);
+  }
+}
+function tick(ts){
+  frame=0;if(!live||document.hidden)return;
+  if(ts>=nextBox){
+    const b=viewport();
+    if(!sameBox(b,box)){box=b;geometry=null;send()}
+    nextBox=ts+40;
+  }
+  listen();
+  if(analyser&&ts>=nextAudio){send();nextAudio=ts+100}
+  paint(Date.now());frame=requestAnimationFrame(tick);
+}
+function wake(){
+  cancelAnimationFrame(frame);frame=0;
+  if(live&&!document.hidden)frame=requestAnimationFrame(tick);
+}
+addEventListener('resize',()=>{resize();send()});
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden){resize();send('hello')}
+  wake();
+});
+setInterval(()=>{
+  if(!live)return;
+  let changed=false;
+  for(const [id,p] of peers)if(Date.now()-p.seen>100000){peers.delete(id);changed=true}
+  if(changed)pair();
+  send();
+},1800);
+addEventListener('pagehide',()=>{send('bye');live=false;wake();channel?.close();stopMic()});
+addEventListener('pageshow',e=>{if(e.persisted){live=true;peers.clear();pair();resize();connect();wake()}});
+resize();connect();wake();
+</script>
+</body>
+</html>
